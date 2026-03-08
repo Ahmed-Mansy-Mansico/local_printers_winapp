@@ -1,122 +1,116 @@
+"""
+Printer handlers – receive pre-rendered HTML from the Frappe server,
+convert to PDF via wkhtmltopdf, and silently print via SumatraPDF.
+"""
+
 import subprocess
-import win32print
-from flask import Flask, request, jsonify, render_template, current_app
-import pdfkit
 import tempfile
-import requests
 import os
 import logging
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+import pdfkit
+import win32print
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+log = logging.getLogger(__name__)
 
 
-def get_printers():
-    """Return a list of available printer names."""
-    return [printer[2] for printer in win32print.EnumPrinters(win32print.PRINTER_ENUM_LOCAL)]
+def get_local_printers() -> list[str]:
+    """Return names of locally-installed printers."""
+    return [p[2] for p in win32print.EnumPrinters(win32print.PRINTER_ENUM_LOCAL)]
 
 
-def print_pdf_silent(pdf_path, printer_name, sumatra_pdf_path):
-    """Print the PDF silently using SumatraPDF."""
+def print_pdf_silent(pdf_path: str, printer_name: str, sumatra_pdf_path: str):
+    """Print a PDF file silently using SumatraPDF."""
+    command = (
+        f'"{sumatra_pdf_path}" -print-to "{printer_name}" '
+        f'-print-settings "noscale" "{pdf_path}"'
+    )
+    log.info("SumatraPDF command: %s", command)
     try:
-        # Use SumatraPDF's -print-to command to print the PDF to the specified printer
-        command = (
-            f'"{sumatra_pdf_path}" -print-to "{printer_name}" '
-            f'-print-settings "noscale" "{pdf_path}"'
-        )
-        logging.info(f"Executing command: {command}")
-
-        # Run the command using subprocess
         subprocess.run(command, shell=True, check=True)
-        logging.info(f"Sent {pdf_path} to printer {printer_name} successfully.")
-        
-    except subprocess.CalledProcessError as e:
-        logging.error(f"Failed to print {pdf_path} on {printer_name}: {e}")
-    except Exception as ex:
-        logging.error(f"An error occurred while printing the PDF: {ex}")
+        log.info("Sent %s to printer '%s'.", pdf_path, printer_name)
+    except subprocess.CalledProcessError as exc:
+        log.error("SumatraPDF failed for '%s': %s", printer_name, exc)
+    except Exception as exc:
+        log.error("Unexpected error printing PDF: %s", exc)
 
 
-def print_html(invoices_data, config_data):
-    """Render HTML template to PDF and print to specified printers."""
-    with current_app.app_context():
-        path_wkhtmltopdf = config_data["WKHTMLTOPDF"]  # Path to wkhtmltopdf executable
-        sumatra_pdf_path = config_data.get("SUMATRA_PDF_PATH", r"C:\Program Files\SumatraPDF\SumatraPDF.exe")  # Path to SumatraPDF
-        letterhead_image = config_data.get("LETTERHEAD_IMAGE")  # Get the letterhead image path
-        frappe_socket_url = config_data.get("FRAPPE_SOCKET_URL")
-
-        # Get current order number from external API
-        order_no = get_order_no(config_data)
-        print(order_no)
-        config = pdfkit.configuration(wkhtmltopdf=path_wkhtmltopdf)
-        printer_names = []
-        
-        for invoice in invoices_data:
-            logging.info(f"Processing invoice: {invoice.get('ksa_einv_qr')}")
-
-            # Render the invoice HTML to PDF
-            rendered_html = render_template(
-                'print_ui.html',
-                frappe_socket_url=frappe_socket_url,
-                letterhead_image=letterhead_image,
-                order_no=order_no.get("order_no"),
-                **invoice
-            )
-            pdf_path = tempfile.mktemp(suffix='.pdf')
-            
-            try:
-                options = {
-                    'no-outline': None,
-                    'encoding': 'utf-8',
-                    'enable-local-file-access': None  # Enable local file access for images
-                }
-                pdfkit.from_string(rendered_html, pdf_path, configuration=config, options=options)
-                logging.info(f"Generated PDF at: {pdf_path}")
-                
-                printer = invoice.get("printer")
-                if printer:
-                    print_pdf_silent(pdf_path, printer, sumatra_pdf_path)
-                    printer_names.append(printer)
-                else:
-                    logging.warning("Printer name not specified, skipping print.")
-                
-            except Exception as e:
-                logging.error(f"Failed to generate or print PDF: {e}")
-            finally:
-                pass
-                # Optionally delete the PDF after printing
-                # if os.path.exists(pdf_path):
-                #     os.remove(pdf_path)
-                #     logging.info(f"Deleted temporary PDF file: {pdf_path}")
-        
-        return printer_names
-
-
-def get_order_no(config_data):
-    """Get the current order number from an external API."""
-    headers = {
-        "Authorization": f"token {config_data['API_KEY']}:{config_data['API_SECRET']}",
-        "Content-Type": "application/json"
+def html_to_pdf(html: str, wkhtmltopdf_path: str) -> str | None:
+    """Convert an HTML string to a temporary PDF file. Returns the PDF path."""
+    config = pdfkit.configuration(wkhtmltopdf=wkhtmltopdf_path)
+    pdf_path = tempfile.mktemp(suffix=".pdf")
+    options = {
+        "no-outline": None,
+        "encoding": "utf-8",
+        "enable-local-file-access": None,
     }
-
     try:
-        response = requests.post(
-            f"{config_data['FRAPPE_SOCKET_URL']}/api/method/local_printers.utils.get_order_no",
-            headers=headers
+        pdfkit.from_string(html, pdf_path, configuration=config, options=options)
+        log.info("Generated PDF: %s", pdf_path)
+        return pdf_path
+    except Exception as exc:
+        log.error("wkhtmltopdf failed: %s", exc)
+        return None
+
+
+def print_jobs(jobs: list[dict], config_data: dict) -> list[str]:
+    """
+    Process a list of print jobs received from the Frappe server.
+
+    Each job dict contains:
+      - html          : fully-rendered HTML (ready to print)
+      - printer       : target printer system name
+      - printer_ip    : (optional) network printer IP
+      - invoice_name  : the Sales Invoice name
+      - is_cashier    : whether this is the cashier copy
+      - print_format  : the Print Format used server-side
+
+    Returns a list of printer names that were printed to.
+    """
+    wkhtmltopdf_path = config_data["WKHTMLTOPDF"]
+    sumatra_pdf_path = config_data.get(
+        "SUMATRA_PDF_PATH", r"C:\Program Files\SumatraPDF\SumatraPDF.exe"
+    )
+
+    printed_to: list[str] = []
+
+    if not isinstance(jobs, list):
+        jobs = [jobs]
+
+    for job in jobs:
+        invoice_name = job.get("invoice_name", "unknown")
+        printer_name = job.get("printer")
+        html = job.get("html")
+
+        if not html:
+            log.warning("Job for invoice %s has no HTML, skipping.", invoice_name)
+            continue
+
+        if not printer_name:
+            log.warning("Job for invoice %s has no printer, skipping.", invoice_name)
+            continue
+
+        log.info(
+            "Printing invoice %s on '%s' (format: %s)",
+            invoice_name,
+            printer_name,
+            job.get("print_format", "Standard"),
         )
 
-        if response.status_code == 200:
-            response_data = response.json()
-            order_no = response_data.get('message')
-            if order_no:
-                logging.info(f"Order number received: {order_no}")
-                return order_no
-            else:
-                logging.error("Order number missing in the response.")
-                return None
-        else:
-            logging.error(f"Failed to get order number. Status code: {response.status_code}, Response: {response.text}")
-            return None
+        pdf_path = html_to_pdf(html, wkhtmltopdf_path)
+        if pdf_path:
+            print_pdf_silent(pdf_path, printer_name, sumatra_pdf_path)
+            printed_to.append(printer_name)
 
-    except requests.RequestException as e:
-        logging.error(f"Error while fetching order number: {e}")
-        return None
+            # Clean up temp PDF
+            try:
+                os.remove(pdf_path)
+                log.info("Cleaned up temp PDF: %s", pdf_path)
+            except OSError:
+                pass
+
+    return printed_to

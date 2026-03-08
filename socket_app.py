@@ -1,167 +1,174 @@
+"""
+Local Printers Windows App – Socket.IO client.
+
+Connects to a Frappe/ERPNext site via Socket.IO, listens for
+'sales_invoice_submitted' events that carry pre-rendered HTML,
+and silently prints each job to the designated local printer.
+"""
+
 import json
-from flask import Flask, request, jsonify, render_template, current_app
+import sys
+import logging
 from threading import Thread
+
 import socketio
 import requests
 import win32print
-from printer_handlers import print_html
-import sys
-import os
-import glob
-import time
 
-app = Flask(__name__)
+from printer_handlers import print_jobs
 
-# Create a Socket.IO client instance
-sio = socketio.Client()
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+log = logging.getLogger(__name__)
 
-def load_config_from_file(config_path):
-    """Load configuration data from a JSON file."""
+# ---------------------------------------------------------------------------
+# Socket.IO client
+# ---------------------------------------------------------------------------
+sio = socketio.Client(reconnection=True, reconnection_delay=5)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+def load_config(config_path: str) -> dict:
+    """Load configuration from a JSON file."""
     try:
-        with open(config_path, 'r') as file:
-            config_data = json.load(file)
-        print("Configuration loaded successfully from file.")
-        return config_data
+        with open(config_path, "r") as fh:
+            data = json.load(fh)
+        log.info("Configuration loaded from %s", config_path)
+        return data
     except FileNotFoundError:
-        print(f"Configuration file {config_path} not found.")
-        sys.exit("Exiting due to missing configuration file.")
-    except json.JSONDecodeError as e:
-        print(f"Error decoding JSON from config file: {e}")
-        sys.exit("Exiting due to invalid configuration format.")
+        sys.exit(f"Configuration file {config_path} not found.")
+    except json.JSONDecodeError as exc:
+        sys.exit(f"Invalid JSON in config file: {exc}")
 
-def get_printers():
-    """Return a list of available printer names."""
-    return [printer[2] for printer in win32print.EnumPrinters(win32print.PRINTER_ENUM_LOCAL)]
 
-def send_printers_data(printers, config_data):
-    """Send the list of printers to the Frappe server."""
+def get_local_printers() -> list[str]:
+    """Return names of locally-installed printers."""
+    return [p[2] for p in win32print.EnumPrinters(win32print.PRINTER_ENUM_LOCAL)]
+
+
+def send_printers_to_server(printers: list[str], cfg: dict):
+    """Register local printer names on the Frappe server."""
     headers = {
-        "Authorization": f"token {config_data['API_KEY']}:{config_data['API_SECRET']}",
-        "Content-Type": "application/json"
+        "Authorization": f"token {cfg['API_KEY']}:{cfg['API_SECRET']}",
+        "Content-Type": "application/json",
     }
+    try:
+        resp = requests.post(
+            f"{cfg['FRAPPE_SOCKET_URL']}/api/method/local_printers.utils.save_printers_data",
+            json={"printers": printers},
+            headers=headers,
+            timeout=30,
+        )
+        if resp.ok:
+            log.info("Printers data sent to server.")
+        else:
+            log.warning("Failed to send printers (%s): %s", resp.status_code, resp.text)
+    except requests.RequestException as exc:
+        log.error("Error sending printers to server: %s", exc)
 
-    response = requests.post(
-        f"{config_data['FRAPPE_SOCKET_URL']}/api/method/local_printers.utils.save_printers_data",
-        json={"printers": printers}, headers=headers
-    )
 
-    if response.status_code == 200:
-        print("Printers data successfully sent to ERP.")
-    else:
-        print(f"Failed to send printers data. Status code: {response.status_code}, Response: {response.text}")
+def fetch_session_cookies(cfg: dict) -> str | None:
+    """Log in and return a cookie header string."""
+    try:
+        resp = requests.post(cfg["LOGIN_URL"], data=cfg["AUTH_DATA"], timeout=30)
+        resp.raise_for_status()
+        cookie_header = "; ".join(f"{k}={v}" for k, v in resp.cookies.items())
+        log.info("Login successful.")
+        return cookie_header
+    except requests.RequestException as exc:
+        log.error("Login failed: %s", exc)
+        return None
 
 
-
-
+# ---------------------------------------------------------------------------
+# Socket.IO event handlers
+# ---------------------------------------------------------------------------
 @sio.event
 def connect():
-    """Handle successful connection to the server."""
-    print("Connected to the server")
-    printers = get_printers()
-    print("Available printers:", printers)
-    send_printers_data(printers, config_data)
+    log.info("Connected to server.")
+    printers = get_local_printers()
+    log.info("Local printers: %s", printers)
+    send_printers_to_server(printers, config_data)
+
 
 @sio.event
 def connect_error(data):
-    """Handle connection errors."""
-    print(f"Connection failed: {data}")
+    log.error("Connection error: %s", data)
+
 
 @sio.event
 def disconnect():
-    """Handle disconnection from the server."""
-    print("Disconnected from the server")
+    log.warning("Disconnected from server.")
 
-@sio.on('sales_invoice_submitted')
+
+@sio.on("sales_invoice_submitted")
 def handle_sales_invoice_submitted(data):
-    """Handle the 'sales_invoice_submitted' event and print the invoice."""
-    with app.app_context():
-        invoice_name = data[0].get('name')
-        print(f"Received Sales Invoice: <<{invoice_name}>> Submitted event. Number of invoices: {len(data)}")
-        print_html(data, config_data)
-
-def fetch_session_cookies(config_data):
-    """Log in to the server and fetch session cookies."""
-    try:
-        response = requests.post(config_data["LOGIN_URL"], data=config_data["AUTH_DATA"])
-        response.raise_for_status()
-        cookies = response.cookies
-        cookie_header = "; ".join([f"{key}={value}" for key, value in cookies.items()])
-        print("Login successful, cookies fetched:", cookie_header)
-        return cookie_header
-    except requests.exceptions.RequestException as e:
-        print(f"Failed to fetch session cookies: {str(e)}")
-        return None
-
-def run_socketio_client(config_data):
-    """Connect the Socket.IO client to the server using session cookies."""
-    cookie_header = fetch_session_cookies(config_data)
-    if not cookie_header:
-        print("Cannot connect without valid session cookies.")
+    """
+    Receive a list of print-job dicts from the server.
+    Each dict contains:
+      - html          : fully-rendered, ready-to-print HTML
+      - printer       : target printer name
+      - printer_ip    : (optional) network printer IP
+      - invoice_name  : Sales Invoice name (for logging)
+      - is_cashier    : whether this is the cashier copy
+      - print_format  : name of the print format used
+    """
+    if not data:
+        log.warning("Received empty print data, ignoring.")
         return
 
-    headers = {'Cookie': cookie_header}
+    first = data[0] if isinstance(data, list) else data
+    invoice = first.get("invoice_name", "unknown")
+    count = len(data) if isinstance(data, list) else 1
+    log.info("Received %d print job(s) for invoice %s", count, invoice)
+
+    print_jobs(data, config_data)
+
+
+# ---------------------------------------------------------------------------
+# Connection logic
+# ---------------------------------------------------------------------------
+def run_socketio_client(cfg: dict):
+    """Connect to the Frappe realtime server."""
+    cookie_header = fetch_session_cookies(cfg)
+    if not cookie_header:
+        log.error("Cannot connect without valid session cookies.")
+        return
+
+    headers = {"Cookie": cookie_header}
     try:
-        # Validate the domain via an API call
-        response = requests.get(
-            "https://localprinters.psc-s.com/api/method/validate_local_printers.validate_users.validate_domain",
-            json={"config_data": config_data}
+        sio.connect(
+            cfg["FRAPPE_SOCKET_URL"],
+            headers=headers,
+            transports=["websocket"],
         )
-        response_data = response.json()
-
-        if response_data.get("message", {}).get("status") == "valid":
-            print(f" '{config_data['FRAPPE_SOCKET_URL']}' is valid. Proceeding with the connection...")
-            try:
-                sio.connect(config_data["FRAPPE_SOCKET_URL"], headers=headers, transports=['websocket'])
-                sio.wait()  # Keep the connection open
-            except Exception as e:
-                print(f"Failed to connect or error during connection: {str(e)}")
-        else:
-            print(f"Validation failed: {response_data}")
-    
-    except requests.exceptions.RequestException as e:
-        print(f"Error during domain validation: {str(e)}")
-
-def disconnect_socketio_client():
-    """Disconnect the Socket.IO client."""
-    try:
-        sio.disconnect()
-        print("Client has been disconnected.")
-    except Exception as e:
-        print(f"Error during disconnection: {str(e)}")
+        sio.wait()
+    except Exception as exc:
+        log.error("Socket.IO connection error: %s", exc)
 
 
-
-
-def validate_domain(config_data):
-    """Validate domain periodically and exit script forcefully if invalid."""
-    try:
-        while True:
-            response = requests.get(
-                "https://localprinters.psc-s.com/api/method/validate_local_printers.validate_users.validate_domain",
-                json={"config_data": config_data}
-            )
-            response_data = response.json()
-
-            if response_data.get("message", {}).get("status") == "valid":
-                print(f"'{config_data['FRAPPE_SOCKET_URL']}' is valid. Proceeding with the connection...")
-            else:
-                print(response_data)
-                print(f"'{config_data['FRAPPE_SOCKET_URL']}' is invalid. Exiting the script.")
-                os._exit(1)  # Forcefully exit the script
-
-            # Sleep for 36 seconds before checking again (you can adjust this to your needs)
-            time.sleep(3600)
-
-    except Exception as e:
-        print(f"An error occurred while validating the domain: {e}")
-        os._exit(1)  # Forcefully exit on error
-
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    # Load configuration from file
     config_path = "config.json"
-    config_data = load_config_from_file(config_path)
+    config_data = load_config(config_path)
 
-    # Start the Socket.IO client in a separate thread
-    Thread(target=run_socketio_client, args=(config_data,)).start()
-    # Start another thread to validate the domain
-    Thread(target=validate_domain, args=(config_data,)).start()
+    # Single thread – connect and listen
+    Thread(target=run_socketio_client, args=(config_data,), daemon=True).start()
+
+    # Keep main thread alive
+    try:
+        import time
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        log.info("Shutting down…")
+        sio.disconnect()

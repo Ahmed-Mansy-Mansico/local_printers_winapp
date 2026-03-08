@@ -1,13 +1,12 @@
 {
-    "CORS_ORIGINS": ["https://domain"],
-    "FRAPPE_SOCKET_URL": "https://domain",
-    "LOGIN_URL": "https://domain/api/method/login",
+    "FRAPPE_SOCKET_URL": "https://your-site.com",
+    "LOGIN_URL": "https://your-site.com/api/method/login",
     "AUTH_DATA": {
         "usr": "Administrator",
         "pwd": "password"
     },
-    "API_KEY": "API_KEY",
-    "API_SECRET": "API_SECRET",
+    "API_KEY": "your-api-key",
+    "API_SECRET": "your-api-secret",
     "WKHTMLTOPDF": "C:\\Program Files\\wkhtmltopdf\\bin\\wkhtmltopdf.exe",
-    "LETTERHEAD_IMAGE": "C:\\Users\\path\\to\\dist\\letterhead_image.png"
+    "SUMATRA_PDF_PATH": "C:\\Program Files\\SumatraPDF\\SumatraPDF.exe"
 }
