@@ -101,11 +101,6 @@ def send_printers_to_server(printers: list[str], cfg: dict):
         log.error("Error sending printers to server: %s", exc)
 
 
-def get_site_name(url: str) -> str:
-    """Extract the hostname from the Frappe URL to use as Socket.IO namespace."""
-    return urlparse(url).hostname
-
-
 def fetch_session_cookies(cfg: dict) -> str | None:
     """Log in and return a cookie header string."""
     print(f"[AUTH] Logging in to {cfg['LOGIN_URL']} ...")
@@ -123,67 +118,62 @@ def fetch_session_cookies(cfg: dict) -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Socket.IO event handlers
+# Socket.IO event handlers (registered dynamically with namespace in main)
 # ---------------------------------------------------------------------------
-def register_event_handlers(site_name: str):
-    """Register Socket.IO event handlers on the site namespace."""
-    ns = f"/{site_name}"
+def on_connect():
+    print(f"\n[SOCKET] ✅ Connected to server!")
+    log.info("Connected to server.")
+    printers = get_local_printers()
+    print(f"[SOCKET] Local printers detected: {printers}")
+    log.info("Local printers: %s", printers)
+    send_printers_to_server(printers, config_data)
+    print(f"[SOCKET] Listening for 'sales_invoice_submitted' events ...\n")
 
-    @sio.on("connect", namespace=ns)
-    def on_connect():
-        print(f"\n[SOCKET] ✅ Connected to server (namespace: {ns})!")
-        log.info("Connected to server on namespace %s.", ns)
-        printers = get_local_printers()
-        print(f"[SOCKET] Local printers detected: {printers}")
-        log.info("Local printers: %s", printers)
-        send_printers_to_server(printers, config_data)
-        print(f"[SOCKET] Listening for 'sales_invoice_submitted' events ...\n")
 
-    @sio.on("connect_error", namespace=ns)
-    def on_connect_error(data):
-        print(f"[SOCKET] ❌ Connection error: {data}")
-        log.error("Connection error: %s", data)
+def on_connect_error(data):
+    print(f"[SOCKET] ❌ Connection error: {data}")
+    log.error("Connection error: %s", data)
 
-    @sio.on("disconnect", namespace=ns)
-    def on_disconnect():
-        print(f"[SOCKET] ⚠️  Disconnected from server.")
-        log.warning("Disconnected from server.")
 
-    @sio.on("sales_invoice_submitted", namespace=ns)
-    def handle_sales_invoice_submitted(data):
-        """
-        Receive a list of print-job dicts from the server.
-        Each dict contains:
-          - html          : fully-rendered, ready-to-print HTML
-          - printer       : target printer name
-          - printer_ip    : (optional) network printer IP
-          - invoice_name  : Sales Invoice name (for logging)
-          - is_cashier    : whether this is the cashier copy
-          - print_format  : name of the print format used
-        """
-        print(f"\n{'*'*60}")
-        print(f"[EVENT] 📨 Received 'sales_invoice_submitted' event from ERP!")
-        print(f"{'*'*60}")
-        log.info("Received 'sales_invoice_submitted' event.")
+def on_disconnect():
+    print(f"[SOCKET] ⚠️  Disconnected from server.")
+    log.warning("Disconnected from server.")
 
-        if not data:
-            print(f"[EVENT] ⚠️  Data is EMPTY – nothing to print.")
-            log.warning("Received empty print data, ignoring.")
-            return
 
-        jobs = data if isinstance(data, list) else [data]
-        count = len(jobs)
-        first = jobs[0]
-        invoice = first.get("invoice_name", "unknown")
+def handle_sales_invoice_submitted(data):
+    """
+    Receive a list of print-job dicts from the server.
+    Each dict contains:
+      - pdf_base64    : base64-encoded PDF (ready to print)
+      - printer       : target printer name
+      - printer_ip    : (optional) network printer IP
+      - invoice_name  : Sales Invoice name (for logging)
+      - is_cashier    : whether this is the cashier copy
+      - print_format  : name of the print format used
+    """
+    print(f"\n{'*'*60}")
+    print(f"[EVENT] 📨 Received 'sales_invoice_submitted' event from ERP!")
+    print(f"{'*'*60}")
+    log.info("Received 'sales_invoice_submitted' event.")
 
-        print(f"[EVENT] Invoice     : {invoice}")
-        print(f"[EVENT] Total jobs  : {count}")
-        for j in jobs:
-            print(f"[EVENT]   -> printer='{j.get('printer')}' format='{j.get('print_format')}' cashier={j.get('is_cashier')}")
-        log.info("Received %d print job(s) for invoice %s", count, invoice)
+    if not data:
+        print(f"[EVENT] ⚠️  Data is EMPTY – nothing to print.")
+        log.warning("Received empty print data, ignoring.")
+        return
 
-        printed = print_jobs(data, config_data)
-        print(f"[EVENT] Printing complete. Printers used: {printed if printed else 'NONE'}")
+    jobs = data if isinstance(data, list) else [data]
+    count = len(jobs)
+    first = jobs[0]
+    invoice = first.get("invoice_name", "unknown")
+
+    print(f"[EVENT] Invoice     : {invoice}")
+    print(f"[EVENT] Total jobs  : {count}")
+    for j in jobs:
+        print(f"[EVENT]   -> printer='{j.get('printer')}' format='{j.get('print_format')}' cashier={j.get('is_cashier')}")
+    log.info("Received %d print job(s) for invoice %s", count, invoice)
+
+    printed = print_jobs(data, config_data)
+    print(f"[EVENT] Printing complete. Printers used: {printed if printed else 'NONE'}")
 
 
 # ---------------------------------------------------------------------------
@@ -197,18 +187,14 @@ def run_socketio_client(cfg: dict):
         log.error("Cannot connect without valid session cookies.")
         return
 
-    site_name = get_site_name(cfg["FRAPPE_SOCKET_URL"])
-    ns = f"/{site_name}"
-    register_event_handlers(site_name)
-
-    print(f"[SOCKET] Connecting to {cfg['FRAPPE_SOCKET_URL']} (namespace: {ns}) ...")
+    print(f"[SOCKET] Connecting to {cfg['FRAPPE_SOCKET_URL']} (namespace: {NAMESPACE}) ...")
     headers = {"Cookie": cookie_header}
     try:
         sio.connect(
             cfg["FRAPPE_SOCKET_URL"],
             headers=headers,
             transports=["websocket"],
-            namespaces=[ns],
+            namespaces=[NAMESPACE],
         )
         sio.wait()
     except Exception as exc:
@@ -227,6 +213,17 @@ if __name__ == "__main__":
 
     config_path = "config.json"
     config_data = load_config(config_path)
+
+    # Derive Socket.IO namespace from site URL (Frappe uses /{sitename})
+    site_name = urlparse(config_data["FRAPPE_SOCKET_URL"]).hostname
+    NAMESPACE = f"/{site_name}"
+    print(f"  Socket.IO namespace: {NAMESPACE}")
+
+    # Register event handlers on the site-specific namespace
+    sio.on("connect", on_connect, namespace=NAMESPACE)
+    sio.on("connect_error", on_connect_error, namespace=NAMESPACE)
+    sio.on("disconnect", on_disconnect, namespace=NAMESPACE)
+    sio.on("sales_invoice_submitted", handle_sales_invoice_submitted, namespace=NAMESPACE)
 
     # Single thread – connect and listen
     Thread(target=run_socketio_client, args=(config_data,), daemon=True).start()

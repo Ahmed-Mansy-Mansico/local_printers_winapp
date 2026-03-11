@@ -1,15 +1,15 @@
 """
-Printer handlers – receive pre-rendered HTML from the Frappe server,
-convert to PDF via wkhtmltopdf, and silently print via SumatraPDF.
+Printer handlers – receive PDF (base64-encoded) from the Frappe server
+and silently print via SumatraPDF.
 """
 
+import base64
 import subprocess
 import tempfile
 import os
 import logging
 from logging.handlers import RotatingFileHandler
 
-import pdfkit
 import win32print
 
 # ---------------------------------------------------------------------------
@@ -58,26 +58,20 @@ def print_pdf_silent(pdf_path: str, printer_name: str, sumatra_pdf_path: str):
         log.error("Unexpected error printing PDF: %s", exc)
 
 
-def html_to_pdf(html: str, wkhtmltopdf_path: str) -> str | None:
-    """Convert an HTML string to a temporary PDF file. Returns the PDF path."""
-    config = pdfkit.configuration(wkhtmltopdf=wkhtmltopdf_path)
-    pdf_path = tempfile.mktemp(suffix=".pdf")
-    options = {
-        "no-outline": None,
-        "encoding": "utf-8",
-        "enable-local-file-access": None,
-        "load-error-handling": "ignore",
-        "load-media-error-handling": "ignore",
-    }
-    print(f"[PDF] Converting HTML to PDF ({len(html)} chars) ...")
+def save_pdf_from_base64(pdf_base64: str) -> str | None:
+    """Decode a base64-encoded PDF and save to a temporary file. Returns the PDF path."""
+    print(f"[PDF] Decoding base64 PDF ({len(pdf_base64)} chars) ...")
     try:
-        pdfkit.from_string(html, pdf_path, configuration=config, options=options)
-        print(f"[PDF] ✅ Generated PDF: {pdf_path}")
-        log.info("Generated PDF: %s", pdf_path)
+        pdf_bytes = base64.b64decode(pdf_base64)
+        fd, pdf_path = tempfile.mkstemp(suffix=".pdf")
+        with os.fdopen(fd, "wb") as f:
+            f.write(pdf_bytes)
+        print(f"[PDF] ✅ Saved PDF: {pdf_path}")
+        log.info("Saved PDF from base64: %s", pdf_path)
         return pdf_path
     except Exception as exc:
-        print(f"[PDF] ❌ wkhtmltopdf FAILED: {exc}")
-        log.error("wkhtmltopdf failed: %s", exc)
+        print(f"[PDF] ❌ Failed to decode/save PDF: {exc}")
+        log.error("Failed to decode/save PDF: %s", exc)
         return None
 
 
@@ -86,7 +80,7 @@ def print_jobs(jobs: list[dict], config_data: dict) -> list[str]:
     Process a list of print jobs received from the Frappe server.
 
     Each job dict contains:
-      - html          : fully-rendered HTML (ready to print)
+      - pdf_base64    : base64-encoded PDF (ready to print)
       - printer       : target printer system name
       - printer_ip    : (optional) network printer IP
       - invoice_name  : the Sales Invoice name
@@ -95,7 +89,6 @@ def print_jobs(jobs: list[dict], config_data: dict) -> list[str]:
 
     Returns a list of printer names that were printed to.
     """
-    wkhtmltopdf_path = config_data["WKHTMLTOPDF"]
     sumatra_pdf_path = config_data.get(
         "SUMATRA_PDF_PATH", r"C:\Program Files\SumatraPDF\SumatraPDF.exe"
     )
@@ -115,24 +108,24 @@ def print_jobs(jobs: list[dict], config_data: dict) -> list[str]:
         printer_name = job.get("printer")
         print_format = job.get("print_format", "Standard")
         is_cashier = job.get("is_cashier", False)
-        html = job.get("html")
+        pdf_base64 = job.get("pdf_base64")
 
         print(f"\n--- Job {i}/{len(jobs)} ---")
         print(f"  Invoice   : {invoice_name}")
         print(f"  Printer   : {printer_name}")
         print(f"  Format    : {print_format}")
         print(f"  Is Cashier: {is_cashier}")
-        print(f"  HTML      : {'Yes (' + str(len(html)) + ' chars)' if html else 'NO ❌'}")
+        print(f"  PDF       : {'Yes (' + str(len(pdf_base64)) + ' chars b64)' if pdf_base64 else 'NO ❌'}")
 
         log.info(
-            "Job %d/%d – invoice=%s printer=%s format=%s is_cashier=%s html_len=%s",
+            "Job %d/%d – invoice=%s printer=%s format=%s is_cashier=%s pdf_b64_len=%s",
             i, len(jobs), invoice_name, printer_name, print_format, is_cashier,
-            len(html) if html else 0,
+            len(pdf_base64) if pdf_base64 else 0,
         )
 
-        if not html:
-            print(f"  ⚠️  SKIPPED – no HTML content")
-            log.warning("Job for invoice %s has no HTML, skipping.", invoice_name)
+        if not pdf_base64:
+            print(f"  ⚠️  SKIPPED – no PDF content")
+            log.warning("Job for invoice %s has no PDF, skipping.", invoice_name)
             continue
 
         if not printer_name:
@@ -140,19 +133,19 @@ def print_jobs(jobs: list[dict], config_data: dict) -> list[str]:
             log.warning("Job for invoice %s has no printer, skipping.", invoice_name)
             continue
 
-        pdf_path = html_to_pdf(html, wkhtmltopdf_path)
+        pdf_path = save_pdf_from_base64(pdf_base64)
         if pdf_path:
             print_pdf_silent(pdf_path, printer_name, sumatra_pdf_path)
             printed_to.append(printer_name)
 
             # Clean up temp PDF
             try:
-                os.remove(pdf_path)
+                # os.remove(pdf_path)
                 log.info("Cleaned up temp PDF: %s", pdf_path)
             except OSError:
                 pass
         else:
-            print(f"  ❌ PDF generation failed – nothing sent to printer")
+            print(f"  ❌ PDF save failed – nothing sent to printer")
 
     print(f"\n{'='*60}")
     print(f"[JOBS] Done. Printed to: {printed_to if printed_to else 'NONE'}")
